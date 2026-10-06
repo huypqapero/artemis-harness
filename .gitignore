@@ -101,6 +101,9 @@ data_engine.db-journal
 live_screenshot*.jpg
 live_screenshot*.png
 
+# Session artifacts (plans, reports, screenshots)
+plans/
+
 # Environment & Secrets
 .env
 .env.*
