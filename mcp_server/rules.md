@@ -14,7 +14,34 @@ Write executable tests based on device behavior verified with **ARTEMIS**. Befor
   - **Pragmatic Timing Judgment**: When a user request mentions performing an action for a specific duration (e.g., "stay on this screen for 2 minutes"), evaluate whether exact timing is functionally critical. Often, these durations are rough guidelines rather than strict test constraints—exercise flexibility and pragmatic engineering judgment to achieve the verification goal efficiently.
 
 
-### 2. ARTEMIS Closed-Loop Architecture Mastery
+### 2. Server Mode: Agent vs. Harness
+Before dispatching work, check which **server mode** the ARTEMIS MCP server was started in. The mode decides whether ARTEMIS runs its own LLM agent on-device or whether YOU (the coding agent) must drive the loop step by step.
+
+- **Harness mode** (the default in this fork). Your tool list contains **no** `mobile_run_task` / `mobile_manage_task`; instead you have raw primitives: `mobile_find_element`, `mobile_tap`, `mobile_long_press`, `mobile_swipe`, `mobile_type`, `mobile_clear_text`, `mobile_press_back`, `mobile_press_home`, `mobile_press_key`, `mobile_launch_app`, `mobile_stop_app`, `mobile_open_url`, `mobile_shell`, `mobile_take_screenshot`, plus the always-on `mobile_get_device_state` / `mobile_inspect_trace` / `mobile_diagnose`. ARTEMIS does **not** load an LLM provider in this mode — you are the brain.
+- **Agent mode** (legacy upstream behavior; opt-in via `uv run artemis mcp --mode agent` or `ARTEMIS_MCP_MODE=agent`). Your tool list contains `mobile_run_task` and `mobile_manage_task`. Only pick this mode when you specifically want ARTEMIS's own Flash / Pro loop to drive the device and the user has configured an LLM API key. Then follow sections 3-6 below.
+
+#### How to detect the active mode
+
+Trust your actual tool list, not assumptions:
+
+- `mobile_run_task` present ⇒ **agent mode**.
+- `mobile_run_task` absent **and** at least one primitive (`mobile_tap`, `mobile_find_element`, …) present ⇒ **harness mode**.
+
+If neither signal is present at all, call `mobile_diagnose` — the server may have failed to start.
+
+#### Harness-mode loop discipline
+
+When operating in harness mode, drive the device as a strict observe-reason-act loop:
+
+1. **Observe** with `mobile_get_device_state(view_type="hierarchy")` — this is the simplified labeled element list the ARTEMIS Operator itself sees. Use `view_type="screenshot"` only when visual confirmation is needed; it costs more.
+2. **Locate** with `mobile_find_element` (prefer `resource_id` → `text` → `content_desc`, in that order) and record the returned `center` coordinates.
+3. **Act** with the smallest primitive that fits — `mobile_tap`, `mobile_type` (pass `(x, y)` to tap-focus first), `mobile_swipe`, `mobile_press_*`, `mobile_launch_app` / `mobile_stop_app`, or a shell escape via `mobile_shell` when no dedicated primitive exists.
+4. **Verify** with another `mobile_get_device_state`. Do not chain multiple actions blindly — a hierarchy fetch between steps catches transient dialogs and bad focus early.
+5. **Fallback**: if `mobile_find_element` returns `found: false`, re-observe (the view may still be transitioning), then try alternate locators, OCR hints from the hierarchy view, or a visually-verified coordinate tap. Never guess coordinates against a stale screenshot.
+
+In harness mode, every reasoning step runs on **your** model (e.g. Claude Code), so section 3's Flash / Pro timing budget (3-5s vs 15-40s per step) does **not** apply. Read section 3 as reference describing the LLM-side agent you are replacing, not as something that executes for you.
+
+### 3. ARTEMIS Closed-Loop Architecture Mastery
 Deeply understand and select between ARTEMIS's dual execution models (**ARTEMIS Flash** and **ARTEMIS Pro**) based on the task scenario, and master their corresponding workflows:
 
 - **ARTEMIS Flash (Fast / Reactive Model)**:
@@ -30,7 +57,7 @@ Deeply understand and select between ARTEMIS's dual execution models (**ARTEMIS 
     - **Checker (Verification)**: A read-only verifier with the same observation tools as the Operator audits plan-declared checkpoints and performs an exit final review against the original goal; `verification_level` selects the depth (`off`, `final` = exit review only and the default, `checkpoints` = every checkpoint plus exit review, `strict` = checkpoints with a larger repair budget where a failed assert halts the run).
     - **Outputter (Optional)**: Synthesizes the entire execution trace into a human-readable report detailing every action step and visual result.
 
-### 3. Device & Environment Constraints & Multi-Device Management
+### 4. Device & Environment Constraints & Multi-Device Management
 - **Device Selection & Multi-Device Execution**: ARTEMIS supports multi-device execution and per-device concurrency. You can control device targeting via two modes:
   - **Direct Device Specification**: Explicitly provide the target phone's serial number via `device_serial` to `mobile_run_task` or `mobile_get_device_state`. Tasks targeting distinct devices run concurrently without blocking each other.
   - **Automatic Device Selection**: When `device_serial` is omitted or set to `None`, ARTEMIS automatically selects an available connected device or allocates an idle device from the device pool.
@@ -42,7 +69,7 @@ Deeply understand and select between ARTEMIS's dual execution models (**ARTEMIS 
 - **Hardware Prerequisites**: Running ARTEMIS requires at least one physically connected, fully authorized Android device (e.g., a Pixel phone) or an active emulator.
 - **Per-Device Mutual Exclusion**: ARTEMIS manages per-device execution mutexes (`DeviceExecutionLock`). A device can only execute a single task at a time (FIFO queue), while different devices can execute tasks in parallel.
 
-### 4. Robust Test Code Design (The "Dynamic-First, Coordinate-Fallback" Philosophy)
+### 5. Robust Test Code Design (The "Dynamic-First, Coordinate-Fallback" Philosophy)
 *If your task involves authoring test code, you must adhere to the following design principles for maximum reliability:*
 - **Adapt to Framework Capabilities**: You must first assess what locating mechanisms the user's test framework supports (e.g., resource IDs, XPath, text matching, OCR, image template matching, or absolute/relative coordinates).
 - **The Core Principle: Dynamic-First, Coordinate-Fallback**:
@@ -55,7 +82,7 @@ Deeply understand and select between ARTEMIS's dual execution models (**ARTEMIS 
   - **Coordinate-Only Frameworks**: If the framework only supports coordinates, ensure the coordinates are well-documented, and where possible, parameterized or made relative to screen boundaries to mitigate resolution differences.
   - **Dynamic-Only Frameworks**: If the framework does not support coordinate-based clicks, focus entirely on generating highly robust dynamic locators, leveraging ARTEMIS's element descriptions and XML tree analysis.
 
-### 5. Environment Self-Diagnosis (`mobile_diagnose`)
+### 6. Environment Self-Diagnosis (`mobile_diagnose`)
 - **Diagnose before guessing**: Whenever an ARTEMIS tool returns an error, a task fails to start or is rejected, no device is found, or the user reports that ARTEMIS "doesn't work" in the IDE, call `mobile_diagnose` first. Do not troubleshoot by re-running `mobile_run_task` on trial and error, and do not ask the user to run `adb` commands by hand before you have the report.
 - **If `mobile_diagnose` is not in your tool list at all**, the MCP server itself failed to start: check the IDE's MCP server log and run `uv run artemis doctor` in the project directory (the CLI shares the same checks).
 - **Follow `next_steps` in order**: The report lists fixes in dependency order (Python runtime → config → MCP host → LLM credentials → device → optional video toolchain). `Run:` lines are single, local, non-destructive shell commands (one command per line, no `&&`) you may execute yourself (ask before installing software with winget / brew / apt). `Guidance:` lines describe something only the user can do (unlock the phone, tap "Allow" on the USB-debugging prompt, plug in a cable, free a port, tell you which IDE they use) — relay them verbatim. `Docs:` lines are references.

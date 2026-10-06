@@ -90,8 +90,23 @@ from artemis.runtime import shutdown_awake_service, start_awake_service
 import threading
 
 
-def main(transport: str = "stdio", host: str = "127.0.0.1", port: int = 8001):
-    """Main entrypoint to run the Artemis Mobile Agent MCP server."""
+def main(
+    transport: str = "stdio",
+    host: str = "127.0.0.1",
+    port: int = 8001,
+    mode: str | None = None,
+):
+    """Main entrypoint to run the Artemis Mobile Agent MCP server.
+
+    When ``mode`` is passed it is exported as ``ARTEMIS_MCP_MODE`` before any
+    tool import happens inside this process. Callers invoking the server
+    through ``python -m mcp_server`` can also set the env var directly.
+    Supported values: ``agent`` (default; LLM-driven autonomous surface) and
+    ``harness`` (primitives only; the external coding agent is the brain).
+    """
+    if mode:
+        os.environ["ARTEMIS_MCP_MODE"] = mode.strip().lower()
+
     threading.Thread(target=start_awake_service, daemon=True, name="artemis-awake-init").start()
     try:
         if transport.lower() == "sse":

@@ -23,8 +23,9 @@ import threading
 import tomllib
 from typing import Annotated
 
-from mcp_server.base import mcp as agent_mcp
-import mcp_server.tools  # noqa: F401
+# NOTE: ``mcp_server.base`` and ``mcp_server.tools`` are intentionally imported
+# lazily inside ``mcp_command`` below. Their import-time behavior depends on
+# ``ARTEMIS_MCP_MODE``, which the ``--mode`` flag sets before the launch path.
 from mcp_server.utils import env_utils
 from artemis.mcp.adb_server import mcp as adb_mcp
 from artemis.runtime import shutdown_awake_service, start_awake_service
@@ -700,6 +701,19 @@ def mcp_command(
             help="Type of MCP server to start: 'agent' (default, universal IDE mobile agent), 'adb' (raw adb), 'xml' (xml fuzzy search).",
         ),
     ] = "agent",
+    mode: Annotated[
+        str,
+        typer.Option(
+            "--mode",
+            "-m",
+            help=(
+                "Agent-server surface mode (only applies to --type agent): "
+                "'agent' (default; Flash/Pro LLM runs mobile_run_task — needs an LLM API key) "
+                "or 'harness' (expose observation + raw device-control primitives only; "
+                "the external coding agent drives the loop, no LLM API key needed)."
+            ),
+        ),
+    ] = "agent",
     transport: Annotated[
         str,
         typer.Option(
@@ -824,11 +838,29 @@ def mcp_command(
         console.print(syntax)
         raise typer.Exit(0)
 
+    # Resolve agent-surface mode BEFORE importing mcp_server.base / tools, since
+    # both read ARTEMIS_MCP_MODE at import time to decide which tools to register.
+    normalized_mode = (mode or "harness").strip().lower()
+    if normalized_mode not in ("agent", "harness"):
+        logger.error(
+            f"Unsupported --mode value: '{mode}'. Use 'agent' or 'harness'."
+        )
+        raise typer.Exit(1)
+    os.environ["ARTEMIS_MCP_MODE"] = normalized_mode
+
     threading.Thread(target=start_awake_service, daemon=True, name="artemis-awake-init").start()
     try:
         st = server_type.lower()
         if st in ("agent", "mobile", "artemis", "default"):
-            logger.info(f"Starting Artemis Mobile Agent MCP Server over {transport}...")
+            # Lazy import so ARTEMIS_MCP_MODE (set just above) is honored by
+            # mcp_server.base and the conditional registration in mcp_server.tools.
+            from mcp_server.base import mcp as agent_mcp
+            import mcp_server.tools  # noqa: F401 — registration side effects
+
+            logger.info(
+                f"Starting Artemis Mobile Agent MCP Server over {transport} "
+                f"(mode={normalized_mode})..."
+            )
             if transport.lower() == "sse":
                 agent_mcp.run(transport="sse", host=host, port=port)
             else:

@@ -71,12 +71,64 @@ When you run `uv run artemis mcp --install all` (or target a specific IDE like `
 
 *(Note: If you prefer manual configuration, you can also copy the contents of [`rules.md`](./rules.md) into your IDE's system prompt or global rules settings.)*
 
+## 🎛️ Agent Mode vs. Harness Mode
+
+The agent-type server exposes two surface modes, selected with `--mode` (CLI) or the `ARTEMIS_MCP_MODE` environment variable (direct `python -m mcp_server`). The chosen mode is read once at server import and determines which tools are registered.
+
+| Mode | Needs LLM API key | Who drives the loop? | Tools registered |
+| :--- | :---: | :--- | :--- |
+| `harness` *(default in this fork)* | **No** | The external coding agent (e.g. Claude Code) runs its own observe-reason-act loop over MCP | `mobile_get_device_state`, `mobile_inspect_trace`, `mobile_diagnose`, plus **primitive device actions** (see below) |
+| `agent` *(legacy upstream behavior; opt-in)* | **Yes** (Gemini / Anthropic / OpenAI / OpenRouter / xAI) | ARTEMIS's own Flash / Pro agent | `mobile_run_task`, `mobile_manage_task`, `mobile_get_device_state`, `mobile_inspect_trace`, `mobile_diagnose` |
+
+Launch examples:
+
+```bash
+# Default surface in this fork — primitive device control, no API key needed
+uv run artemis mcp
+uv run artemis mcp --mode harness   # same thing, explicit
+
+# Opt in to the legacy LLM-driven agent surface (requires an LLM API key in .env)
+uv run artemis mcp --mode agent
+
+# Direct module invocation picks up ARTEMIS_MCP_MODE (default = harness)
+python -m mcp_server                            # harness
+ARTEMIS_MCP_MODE=agent python -m mcp_server     # legacy agent surface
+```
+
+Why harness? ARTEMIS's internal Flash / Pro loop is itself an LLM agent, so when Claude Code calls `mobile_run_task` the overall call path is **double-agent** — your Claude Code quota pays for planning while ARTEMIS's provider API bills for the on-device loop. Harness mode drops the inner agent and lets Claude Code handle the per-step `state → reason → action` cycle directly against primitive tools, so only your Claude Code quota is consumed.
+
 ## 🛠️ MCP Tools Overview
+
+### Always-on tools (both modes)
+
+* **`mobile_get_device_state`**: Real-time observer (`screenshot` or OCR+XML `hierarchy`) with optional `device_serial`.
+* **`mobile_inspect_trace`**: Granular trace inspection, visual action overlays, agent reasoning, and `device_serial` tracking.
+* **`mobile_diagnose`**: Environment doctor (see details at the end of this section).
+
+### Agent-mode tools (hidden in harness mode)
 
 * **`mobile_run_task`**: Asynchronously launches an autonomous mobile automation task (`Flash` or `Pro` model) with optional `device_serial` targeting. Pro runs can be tuned with `verification_level` (`off` | `final` | `checkpoints` | `strict` — how much the Checker audits) and `explorer_mode` (`flash` | `pro` | `ultra` — the Operator's perception depth).
 * **`mobile_manage_task`**: Manages task lifecycle (`status`, `stop`, `inject_instruction`), returning task state and assigned `device_serial`. Pass `release_loop=True` with `inject_instruction` to gracefully end a `[Loop:continuous]` monitoring task — this explicit signal (not "please stop" wording) is what unlocks the loop milestone's completion.
-* **`mobile_get_device_state`**: Real-time observer (`screenshot` or OCR+XML `hierarchy`) with optional `device_serial`.
-* **`mobile_inspect_trace`**: Granular trace inspection, visual action overlays, agent reasoning, and `device_serial` tracking.
+
+### Harness-mode primitives (hidden in agent mode)
+
+These expose raw Android control so the external coding agent can run the full observe-reason-act loop itself. All accept an optional `device_serial`.
+
+* **`mobile_find_element`**: Locate the first on-screen element matching `text` (substring, case-insensitive), `resource_id` (exact), or `content_desc`. Returns a JSON `{found, bounds, center, text, resource_id, content_desc, class}` object you feed to `mobile_tap`.
+* **`mobile_tap(x, y, times=1, delay_ms=100)`**: Tap at pixel coordinates (optionally multi-tap).
+* **`mobile_long_press(x, y, duration_ms=1000)`**: Long press at coordinates.
+* **`mobile_swipe(start_x, start_y, end_x, end_y, duration_ms=400)`**: Swipe between two points; `duration_ms >= 1000` becomes a drag-and-drop.
+* **`mobile_type(text, x?, y?, clear_before_input=False)`**: Type into the focused field; pass `(x, y)` to tap-focus first; `clear_before_input=True` to replace existing text. Supports `\n`.
+* **`mobile_clear_text(x?, y?)`**: Erase the focused field's text.
+* **`mobile_press_back()` / `mobile_press_home()` / `mobile_press_key(keycode)`**: Hardware-key events (e.g. `KEYCODE_ENTER`, `KEYCODE_TAB`).
+* **`mobile_launch_app(package_name)`**: Cold-start an app by package, with retries for flaky launches.
+* **`mobile_stop_app(package_name)`**: Force-stop an app.
+* **`mobile_open_url(url)`**: Open a URL or deep link.
+* **`mobile_shell(command)`**: Run a raw `adb shell` command and return its stdout. Prefer the dedicated primitives above when they fit.
+* **`mobile_take_screenshot()`**: Return the current screen as a base64-encoded JPEG (complements `mobile_get_device_state(view_type="screenshot")`, which saves to disk and returns a file URI).
+
+### Diagnostics
+
 * **`mobile_diagnose`**: Environment doctor for the IDE. Reuses the readiness probes behind `artemis doctor` and the web console's device wizard (Python runtime, config, LLM credentials, ADB / devices / RSA keys / emulators, video toolchain) plus an MCP-host probe (server interpreter vs project `.venv`, detected MCP client, `.env` location, traces directory, daemon port collisions). Returns a `verdict` (`ready` | `degraded` | `blocked`), an ordered `next_steps` fix list the AI agent can act on (`Run:` one-command lines vs `Guidance:` for the user), scrubbed per-check details, `tasks` holding or waiting for devices, log paths, and the most recent failed task with its `recent_errors`. Optional deep checks: `verify_credentials=true` (live API-key validation, ~12s, result in `credentials`), `probe_device=true` (end-to-end screenshot + UIAutomator hierarchy, ~20s, result in `device_probe`), `launch_avd="<name>"` (boots an installed AVD in the background; re-run after ~60s). `attempt_fix=true` applies the safe self-heals (regenerate corrupted ADB keys, restart the ADB server, clear stale device locks / queue tickets left by crashed runners).
 
 ### 📱 Device Selection & Multi-Device Execution
@@ -90,11 +142,13 @@ ARTEMIS supports parallel execution across multiple connected Android devices an
 
 ### CLI Execution
 ```bash
-# Start server over stdio
+# Start server over stdio (default = harness mode in this fork)
 python -m mcp_server
-
-# Or via Artemis CLI
 uv run artemis mcp
+
+# Legacy LLM-driven agent surface (opt-in; needs API key)
+uv run artemis mcp --mode agent
+ARTEMIS_MCP_MODE=agent python -m mcp_server
 ```
 
 ### IDE Configuration
